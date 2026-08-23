@@ -417,7 +417,6 @@ for row in rows:
         changed += 1
         continue
 
-    print(f"⏩ ГОТОВ: {filename}")
     already_ready += 1
 
 # ============================================================

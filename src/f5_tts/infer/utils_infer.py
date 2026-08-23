@@ -296,7 +296,6 @@ def remove_silence_edges(audio, silence_threshold=-42):
 
 
 def preprocess_ref_audio_text(ref_audio_orig, ref_text, show_info=print):
-    show_info("Converting audio...")
 
     # Compute a hash of the reference audio file
     with open(ref_audio_orig, "rb") as audio_file:
@@ -306,7 +305,6 @@ def preprocess_ref_audio_text(ref_audio_orig, ref_text, show_info=print):
     global _ref_audio_cache
 
     if audio_hash in _ref_audio_cache:
-        show_info("Using cached preprocessed reference audio...")
         ref_audio = _ref_audio_cache[audio_hash]
 
     else:  # first pass, do preprocess
@@ -363,8 +361,6 @@ def preprocess_ref_audio_text(ref_audio_orig, ref_text, show_info=print):
             ref_text = transcribe(ref_audio)
             # Cache the transcribed text (not caching custom ref_text, enabling users to do manual tweak)
             _ref_text_cache[audio_hash] = ref_text
-    else:
-        show_info("Using custom reference text...")
 
     # Ensure ref_text ends with a proper sentence-ending punctuation
     if not ref_text.endswith(". ") and not ref_text.endswith("。"):
@@ -406,8 +402,6 @@ def infer_process(
     for i, gen_text_i in enumerate(gen_text_batches):
         print(f"gen_text {i}", gen_text_i)
     print("\n")
-
-    show_info(f"Generating audio in {len(gen_text_batches)} batches...")
 
     if not gen_text_batches:
         show_info("No text batches to generate.")
