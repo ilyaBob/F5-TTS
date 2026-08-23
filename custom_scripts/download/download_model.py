@@ -28,7 +28,7 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 MODEL_DIR_NAME = os.getenv("MODEL_DIR_NAME")
 
 # Запасной репозиторий для гарантированной загрузки vocab.txt
-FALLBACK_VOCAB_REPO = os.getenv("FALLBACK_VOCAB_REPO")
+FALLBACK_VOCAB_REPO = HF_REPO_MODEL
 # ==========================================
 
 # Динамическое определение локальной директории
