@@ -4,7 +4,6 @@ import sys
 import time
 from pathlib import Path
 
-# Попытка загрузить переменные из .env
 try:
     from dotenv import load_dotenv
 
@@ -26,15 +25,10 @@ from huggingface_hub.utils import (
 # ============================================================
 
 HF_TOKEN = os.getenv("HF_TOKEN")
+WORKER_ID = os.getenv("WORKER_ID", "Colab_1")
+HF_COLLECTION_SLUG = os.getenv("HF_COLLECTION_SLUG")
 
-# Репозитории Hugging Face
-MANIFEST_REPO_ID = os.getenv(
-    "MANIFEST_REPO_ID", "ilya-75/erof-vadim-nebesniy-tron-13"
-)
 MANIFEST_FILENAME = os.getenv("MANIFEST_FILENAME", "dataset_manifest.csv")
-OUTPUT_DATASET_REPO = os.getenv(
-    "OUTPUT_DATASET_REPO", "ilya-75/erof-vadim-nebesniy-tron-13"
-)
 HF_WAV_DIR = os.getenv("HF_WAV_DIR", "generated_wavs")
 
 # Пути к директориям
@@ -51,206 +45,221 @@ VOCAB_FILE_NAME = os.getenv("VOCAB_FILE_NAME")
 CKPT_PATH = os.path.join(LOCAL_CKPT_DIR, CKPT_FILE_NAME)
 VOCAB_PATH = os.path.join(LOCAL_CKPT_DIR, VOCAB_FILE_NAME)
 
-# Референсное аудио и текст
+# Референсы
 REF_AUDIO = os.path.join(
     os.getenv("DATASET_DIR", os.path.join(F5_DIR, "dataset")),
-    os.getenv("WAV_FILENAME"),
+    os.getenv("WAV_FILENAME", ""),
 )
-REF_TEXT = os.getenv(
-    "REF_TEXT"
-)
+REF_TEXT = os.getenv("REF_TEXT")
 
-# Настройки процесса
 UPLOAD_EVERY = int(os.getenv("UPLOAD_EVERY", "50"))
-GENERATED_MANIFEST_FILENAME = os.getenv(
-    "GENERATED_MANIFEST_FILENAME", "generated_manifest.csv"
-)
-GENERATED_MANIFEST_PATH = os.path.join(
-    OUTPUT_DIR, GENERATED_MANIFEST_FILENAME
-)
-
-# ============================================================
-# ПОДГОТОВКА
-# ============================================================
+GENERATED_MANIFEST_FILENAME = os.getenv("GENERATED_MANIFEST_FILENAME", "generated_manifest.csv")
+LOCK_FILENAME = "LOCK_STATUS.txt"
 
 os.makedirs(WORK_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ============================================================
-# TOKEN
-# ============================================================
-
 if not HF_TOKEN:
-    raise RuntimeError(
-        "\n❌ HF_TOKEN не найден.\nУбедитесь, что он задан в .env файле."
-    )
+    raise RuntimeError("\n❌ HF_TOKEN не найден в .env файле.")
 
-token = (
-    HF_TOKEN if HF_TOKEN and not HF_TOKEN.startswith("hf_xxx") else None
-)
+api = HfApi(token=HF_TOKEN)
+
 
 # ============================================================
-# START
+# 🎯 МЕХАНИЗМ БЛОКИРОВКИ И ПОИСКА СВОБОДНОГО РЕПОЗИТОРИЯ
+# ============================================================
+
+def get_collection_repositories(collection_slug):
+    """Получает список всех dataset-репозиториев из коллекции."""
+    print(f"📚 Запрос коллекции: {collection_slug}...")
+    try:
+        collection = api.get_collection(collection_slug)
+        # Фильтруем только датасеты из коллекции
+        repos = [item.item_id for item in collection.items if item.item_type == "dataset"]
+        print(f"✅ Найдено репозиториев в коллекции: {len(repos)}")
+        return repos
+    except Exception as e:
+        print(f"❌ Ошибка получения коллекции: {e}")
+        return []
+
+
+def try_lock_repository(repo_id, worker_id):
+    """
+    Пытается заблокировать репозиторий под текущий WORKER_ID.
+    Возвращает True, если репозиторий успешно заблокирован за нами.
+    """
+    lock_file_path = os.path.join(WORK_DIR, LOCK_FILENAME)
+
+    # 1. Проверяем текущее состояние LOCK_STATUS.txt на HF
+    try:
+        downloaded_lock = hf_hub_download(
+            repo_id=repo_id,
+            filename=LOCK_FILENAME,
+            repo_type="dataset",
+            token=HF_TOKEN,
+            force_download=True
+        )
+        with open(downloaded_lock, "r", encoding="utf-8") as f:
+            current_status = f.read().strip()
+
+        if current_status.startswith("IN_PROGRESS:") and not current_status.endswith(worker_id):
+            print(f"   ⏩ Занят другим воркером: {current_status}")
+            return False
+        elif current_status == "DONE":
+            print("   ⏩ Ужe завершён (DONE).")
+            return False
+
+    except EntryNotFoundError:
+        # Файла блокировки ещё нет — репозиторий свободен
+        pass
+    except Exception as e:
+        print(f"   ⚠️ Ошибка чтения lock-файла: {e}")
+
+    # 2. Пишем свою метку и загружаем на HF
+    print(f"   ✍️ Запись метки {worker_id} в {repo_id}...")
+    with open(lock_file_path, "w", encoding="utf-8") as f:
+        f.write(f"IN_PROGRESS:{worker_id}")
+
+    try:
+        api.upload_file(
+            path_or_fileobj=lock_file_path,
+            path_in_repo=LOCK_FILENAME,
+            repo_id=repo_id,
+            repo_type="dataset",
+            commit_message=f"Lock repo for {worker_id}"
+        )
+    except Exception as e:
+        print(f"   ❌ Ошибка загрузки lock-файла: {e}")
+        return False
+
+    # 3. Пауза 10 секунд (гонка процессов)
+    print("   ⏳ Ожидание 10 сек для проверки гонки процессов...")
+    time.sleep(10)
+
+    # 4. Повторно скачиваем и проверяем, кто остался записан
+    try:
+        downloaded_lock = hf_hub_download(
+            repo_id=repo_id,
+            filename=LOCK_FILENAME,
+            repo_type="dataset",
+            token=HF_TOKEN,
+            force_download=True
+        )
+        with open(downloaded_lock, "r", encoding="utf-8") as f:
+            final_status = f.read().strip()
+
+        if final_status == f"IN_PROGRESS:{worker_id}":
+            print(f"   🎉 УСПЕШНО ЗАБЛОКИРОВАНО за {worker_id}!")
+            return True
+        else:
+            print(f"   ⚠️ Блокировка перехвачена: {final_status}")
+            return False
+    except Exception as e:
+        print(f"   ❌ Ошибка проверки блокировки: {e}")
+        return False
+
+
+def mark_repository_done(repo_id, worker_id):
+    """Помечает репозиторий как полностью обработанный."""
+    lock_file_path = os.path.join(WORK_DIR, LOCK_FILENAME)
+    with open(lock_file_path, "w", encoding="utf-8") as f:
+        f.write("DONE")
+    try:
+        api.upload_file(
+            path_or_fileobj=lock_file_path,
+            path_in_repo=LOCK_FILENAME,
+            repo_id=repo_id,
+            repo_type="dataset",
+            commit_message=f"Mark done by {worker_id}"
+        )
+        print(f"✅ Репозиторий {repo_id} помечен как DONE.")
+    except Exception as e:
+        print(f"⚠️ Не удалось обновить статус DONE: {e}")
+
+
+# ============================================================
+# ПОИСК ЗАДАЧИ
 # ============================================================
 
 print("=" * 70)
-print("F5-TTS SMART BULK GENERATION")
+print(f"🤖 ВОРКЕР: {WORKER_ID}")
 print("=" * 70)
 
-print()
-print(f"📂 F5-TTS:     {F5_DIR}")
-print(f"📂 Output:     {OUTPUT_DIR}")
-print(f"🤗 HF Dataset: {OUTPUT_DATASET_REPO}")
-print()
+repos_to_process = get_collection_repositories(HF_COLLECTION_SLUG)
+
+TARGET_REPO_ID = None
+
+for repo in repos_to_process:
+    print(f"\n🔍 Проверка репозитория: {repo}")
+    if try_lock_repository(repo, WORKER_ID):
+        TARGET_REPO_ID = repo
+        break
+
+if not TARGET_REPO_ID:
+    print("\n" + "=" * 70)
+    print("🎉 ВСЕ РЕПОЗИТОРИИ В КОЛЛЕКЦИИ УЖЕ ОБРАБОТАНЫ ИЛИ ЗАНЯТЫ!")
+    print("=" * 70)
+    sys.exit(0)
+
+# Динамически устанавливаем целевой репозиторий
+MANIFEST_REPO_ID = TARGET_REPO_ID
+OUTPUT_DATASET_REPO = TARGET_REPO_ID
+
+print(f"\n🚀 НАЧИНАЕМ РАБОТУ С РЕПОЗИТОРИЕМ: {TARGET_REPO_ID}")
 
 # ============================================================
-# GPU
+# GPU & ИНИЦИАЛИЗАЦИЯ МОДЕЛИ
 # ============================================================
-
-print("=" * 70)
-print("🔥 ПРОВЕРКА GPU")
-print("=" * 70)
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
     print(f"🚀 GPU: {torch.cuda.get_device_name(0)}")
-    total_memory = (
-        torch.cuda.get_device_properties(0).total_memory / 1024**3
-    )
-    print(f"💾 VRAM: {total_memory:.1f} GB")
-    torch.cuda.empty_cache()
 else:
     DEVICE = "cpu"
-    print("⚠️ CUDA не обнаружена!")
     print("⚠️ Используется CPU.")
 
-# ============================================================
-# 1. ПРОВЕРКА ФАЙЛОВ F5-TTS
-# ============================================================
-
-print()
-print("=" * 70)
-print("🔍 ПРОВЕРКА ФАЙЛОВ")
-print("=" * 70)
-
-if not os.path.exists(CKPT_PATH):
-    raise FileNotFoundError(f"\n❌ Не найден checkpoint:\n{CKPT_PATH}")
-
-if not os.path.exists(VOCAB_PATH):
-    raise FileNotFoundError(f"\n❌ Не найден vocab:\n{VOCAB_PATH}")
-
-if not os.path.exists(REF_AUDIO):
-    raise FileNotFoundError(f"\n❌ Не найден reference audio:\n{REF_AUDIO}")
-
-print(f"✅ Checkpoint: {CKPT_PATH}")
-print(f"✅ Vocab:      {VOCAB_PATH}")
-print(f"✅ Reference:  {REF_AUDIO}")
+if not os.path.exists(CKPT_PATH) or not os.path.exists(VOCAB_PATH) or not os.path.exists(REF_AUDIO):
+    raise FileNotFoundError("❌ Ошибка: Не найдены чекпоинты или референсный WAV!")
 
 # ============================================================
-# 2. HUGGING FACE API
+# СКАЧИВАНИЕ MANIFEST & СУЩЕСТВУЮЩИХ WAV
 # ============================================================
 
-api = HfApi(token=token)
-
-# ============================================================
-# 3. СКАЧИВАЕМ DATASET MANIFEST
-# ============================================================
-
-print()
-print("=" * 70)
-print("📥 СКАЧИВАНИЕ DATASET MANIFEST")
-print("=" * 70)
-
-try:
-    local_manifest_path = hf_hub_download(
-        repo_id=MANIFEST_REPO_ID,
-        filename=MANIFEST_FILENAME,
-        repo_type="dataset",
-        local_dir=WORK_DIR,
-        token=token,
-    )
-    print(f"✅ Manifest скачан:\n{local_manifest_path}")
-
-except (RepositoryNotFoundError, GatedRepoError) as e:
-    print(f"❌ Ошибка доступа к HF:\n{e}")
-    raise
-
-except EntryNotFoundError:
-    print(f"❌ Файл {MANIFEST_FILENAME} не найден в {MANIFEST_REPO_ID}")
-    raise
-
-# ============================================================
-# 4. СКАЧИВАЕМ ВСЕ WAV ОДНИМ ВЫЗОВОМ
-# ============================================================
-
-print()
-print("=" * 70)
-print("📥 СКАЧИВАНИЕ ГОТОВЫХ WAV")
-print("=" * 70)
-
-print("☁️ Скачиваем generated_wavs/*.wav одним вызовом...")
+local_manifest_path = hf_hub_download(
+    repo_id=MANIFEST_REPO_ID,
+    filename=MANIFEST_FILENAME,
+    repo_type="dataset",
+    local_dir=WORK_DIR,
+    token=HF_TOKEN,
+)
 
 try:
     snapshot_dir = snapshot_download(
         repo_id=OUTPUT_DATASET_REPO,
         repo_type="dataset",
         allow_patterns=f"{HF_WAV_DIR}/*.wav",
-        token=token,
+        token=HF_TOKEN,
     )
-
     remote_wavs_dir = os.path.join(snapshot_dir, HF_WAV_DIR)
-
-    if not os.path.exists(remote_wavs_dir):
-        print("ℹ️ Папка generated_wavs на HF пока отсутствует.")
-    else:
-        wav_files = list(Path(remote_wavs_dir).glob("*.wav"))
-        print(f"☁️ Найдено WAV: {len(wav_files)}")
-
+    if os.path.exists(remote_wavs_dir):
         import shutil
 
-        downloaded = 0
-        skipped = 0
-
-        for source_path in wav_files:
-            filename = source_path.name
-            destination_path = os.path.join(OUTPUT_DIR, filename)
-
-            if os.path.exists(destination_path):
-                skipped += 1
-                continue
-
-            shutil.copy2(source_path, destination_path)
-            downloaded += 1
-
-        print()
-        print(f"📥 Скопировано новых WAV: {downloaded}")
-        print(f"⏩ Уже было локально: {skipped}")
-
+        for source_path in Path(remote_wavs_dir).glob("*.wav"):
+            destination_path = os.path.join(OUTPUT_DIR, source_path.name)
+            if not os.path.exists(destination_path):
+                shutil.copy2(source_path, destination_path)
 except Exception as e:
-    print("\n⚠️ Ошибка скачивания WAV:\n", e)
-    print("\nℹ️ Продолжаем с локальными файлами.")
+    print("ℹ️ WAV файлы ранее не загружались или ошибка:", e)
 
 # ============================================================
-# 5. ИМПОРТ F5-TTS
+# ИМПОРТ F5-TTS И ЗАГРУЗКА
 # ============================================================
-
-print()
-print("=" * 70)
-print("🔥 ЗАГРУЗКА F5-TTS")
-print("=" * 70)
 
 SRC_DIR = os.path.join(F5_DIR, "src")
-
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
 from f5_tts.api import F5TTS
-
-# ============================================================
-# 6. ЗАГРУЖАЕМ МОДЕЛЬ ОДИН РАЗ
-# ============================================================
-
-start_model = time.time()
 
 f5tts = F5TTS(
     model="F5TTS_v1_Base",
@@ -259,342 +268,122 @@ f5tts = F5TTS(
     device=DEVICE,
 )
 
-model_time = time.time() - start_model
-print(f"✅ Модель загружена за {model_time:.1f} сек.")
-
-if torch.cuda.is_available():
-    allocated = torch.cuda.memory_allocated() / 1024**3
-    reserved = torch.cuda.memory_reserved() / 1024**3
-    print(f"GPU allocated: {allocated:.2f} GB")
-    print(f"GPU reserved:  {reserved:.2f} GB")
-
 # ============================================================
-# 7. ЧИТАЕМ DATASET MANIFEST
+# ЧТЕНИЕ MANIFEST И ИСТОРИИ
 # ============================================================
-
-print()
-print("=" * 70)
-print("📚 ЧТЕНИЕ MANIFEST")
-print("=" * 70)
 
 rows = []
-
 with open(local_manifest_path, "r", encoding="utf-8") as f:
     reader = csv.DictReader(f)
     for row in reader:
-        filename = row.get("filename")
-        speaker = row.get("speaker")
-        text = row.get("text")
+        if row.get("filename") and row.get("text"):
+            rows.append({
+                "filename": row["filename"].strip(),
+                "speaker": row.get("speaker", "").strip(),
+                "text": row["text"].strip(),
+            })
 
-        if not filename or not text:
-            continue
-
-        rows.append(
-            {
-                "filename": filename.strip(),
-                "speaker": speaker.strip() if speaker else "",
-                "text": text.strip(),
-            }
-        )
-
-print(f"📚 Всего записей: {len(rows)}")
-
-# ============================================================
-# 8. СКАЧИВАЕМ GENERATED MANIFEST С HF
-# ============================================================
-
-print()
-print("=" * 70)
-print("📋 ПРОВЕРКА ИСТОРИИ ГЕНЕРАЦИИ")
-print("=" * 70)
-
+GENERATED_MANIFEST_PATH = os.path.join(OUTPUT_DIR, GENERATED_MANIFEST_FILENAME)
 previous_generated = {}
 
-if os.path.exists(GENERATED_MANIFEST_PATH):
-    print("📋 Найден локальный generated_manifest.csv")
-    try:
-        with open(GENERATED_MANIFEST_PATH, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                filename = row.get("filename")
-                if not filename:
-                    continue
-                previous_generated[filename] = {
-                    "text": row.get("text", ""),
-                    "speaker": row.get("speaker", ""),
-                }
-        print(f"✅ Загружено записей: {len(previous_generated)}")
-    except Exception as e:
-        print(f"⚠️ Ошибка чтения manifest: {e}")
-        previous_generated = {}
-
-if not previous_generated:
-    print("📥 Проверяем generated_manifest.csv на HF...")
-    try:
-        remote_manifest = hf_hub_download(
-            repo_id=OUTPUT_DATASET_REPO,
-            filename=GENERATED_MANIFEST_FILENAME,
-            repo_type="dataset",
-            token=token,
-        )
-
-        with open(remote_manifest, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                filename = row.get("filename")
-                if not filename:
-                    continue
-                previous_generated[filename] = {
-                    "text": row.get("text", ""),
-                    "speaker": row.get("speaker", ""),
-                }
-
-        with open(
-            GENERATED_MANIFEST_PATH, "w", encoding="utf-8", newline=""
-        ) as f:
-            writer = csv.DictWriter(
-                f, fieldnames=["filename", "speaker", "text"]
-            )
-            writer.writeheader()
-            for filename, data in previous_generated.items():
-                writer.writerow(
-                    {
-                        "filename": filename,
-                        "speaker": data["speaker"],
-                        "text": data["text"],
-                    }
-                )
-
-        print(f"✅ История генерации: {len(previous_generated)}")
-
-    except EntryNotFoundError:
-        print("ℹ️ generated_manifest.csv на HF ещё нет.")
-    except Exception as e:
-        print(f"⚠️ Не удалось скачать generated_manifest.csv: {e}")
-
-# ============================================================
-# 9. ОПРЕДЕЛЯЕМ НЕДОСТАЮЩИЕ / ИЗМЕНЁННЫЕ
-# ============================================================
-
-print()
-print("=" * 70)
-print("🔍 ПРОВЕРКА WAV")
-print("=" * 70)
+try:
+    remote_manifest = hf_hub_download(
+        repo_id=OUTPUT_DATASET_REPO,
+        filename=GENERATED_MANIFEST_FILENAME,
+        repo_type="dataset",
+        token=HF_TOKEN,
+    )
+    with open(remote_manifest, "r", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            if r.get("filename"):
+                previous_generated[r["filename"]] = {"text": r.get("text", ""), "speaker": r.get("speaker", "")}
+except Exception:
+    pass
 
 pending = []
-already_ready = 0
-missing = 0
-changed = 0
-unknown = 0
-
 for row in rows:
-    filename = row["filename"]
-    current_text = row["text"]
-    output_path = os.path.join(OUTPUT_DIR, filename)
-
-    if not os.path.exists(output_path):
-        print(f"🎙️ ОТСУТСТВУЕТ: {filename}")
+    fn = row["filename"]
+    out_p = os.path.join(OUTPUT_DIR, fn)
+    if not os.path.exists(out_p):
         pending.append(row)
-        missing += 1
-        continue
+    else:
+        prev = previous_generated.get(fn)
+        if prev and prev.get("text", "").strip() != row["text"].strip():
+            pending.append(row)
 
-    previous = previous_generated.get(filename)
-
-    if previous is None:
-        print(f"⚠️ НЕТ ИСТОРИИ: {filename}\n   ⏩ Оставляем существующий WAV")
-        already_ready += 1
-        unknown += 1
-        continue
-
-    old_text = previous.get("text", "").strip()
-    new_text = current_text.strip()
-
-    if old_text != new_text:
-        print(
-            f"\n🔄 ТЕКСТ ИЗМЕНЁН: {filename}\n   Было: {old_text[:150]}\n   Стало: {new_text[:150]}"
-        )
-        pending.append(row)
-        changed += 1
-        continue
-
-    already_ready += 1
-
-# ============================================================
-# СТАТИСТИКА
-# ============================================================
-
-print()
-print("=" * 70)
-print("📊 РЕЗУЛЬТАТ ПРОВЕРКИ")
-print("=" * 70)
-print(f"Всего записей:       {len(rows)}")
-print(f"Уже готовы:          {already_ready}")
-print(f"Отсутствуют:         {missing}")
-print(f"Текст изменён:       {changed}")
-print(f"Без истории:         {unknown}")
-print(f"Нужно генерировать:  {len(pending)}")
-
-if not pending:
-    print(f"\n🎉 Все WAV уже готовы!\n📂 {OUTPUT_DIR}")
-    sys.exit(0)
-
-
-# ============================================================
-# 10. ФУНКЦИЯ СОХРАНЕНИЯ MANIFEST
-# ============================================================
+print(f"📊 К генерации: {len(pending)} из {len(rows)}")
 
 
 def save_generated_manifest():
-    with open(
-        GENERATED_MANIFEST_PATH, "w", encoding="utf-8", newline=""
-    ) as f:
-        writer = csv.DictWriter(
-            f, fieldnames=["filename", "speaker", "text"]
-        )
+    with open(GENERATED_MANIFEST_PATH, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["filename", "speaker", "text"])
         writer.writeheader()
         for row in rows:
-            filename = row["filename"]
-            output_path = os.path.join(OUTPUT_DIR, filename)
-            if os.path.exists(output_path):
-                writer.writerow(
-                    {
-                        "filename": filename,
-                        "speaker": row["speaker"],
-                        "text": row["text"],
-                    }
-                )
+            if os.path.exists(os.path.join(OUTPUT_DIR, row["filename"])):
+                writer.writerow(row)
 
 
 # ============================================================
-# 11. ГЕНЕРАЦИЯ
+# ЦИКЛ ГЕНЕРАЦИИ
 # ============================================================
 
-print()
-print("=" * 70)
-print("🎙️ НАЧИНАЕМ ГЕНЕРАЦИЮ")
-print("=" * 70)
-print(f"Файлов к генерации: {len(pending)}")
+if pending:
+    success = 0
+    for index, row in enumerate(pending, start=1):
+        filename = row["filename"]
+        output_path = os.path.join(OUTPUT_DIR, filename)
 
-total_start = time.time()
-success = 0
-errors = 0
-
-for index, row in enumerate(pending, start=1):
-    filename = row["filename"]
-    gen_text = row["text"]
-    speaker = row["speaker"]
-    output_path = os.path.join(OUTPUT_DIR, filename)
-
-    print(f"\n{'-' * 70}")
-    print(f"[{index}/{len(pending)}] {filename}")
-    print(f"Speaker: {speaker}")
-    print(
-        f"Text: {gen_text[:200]}"
-        + ("..." if len(gen_text) > 200 else "")
-    )
-
-    start = time.time()
-
-    try:
-        wav, sr, _ = f5tts.infer(
-            ref_file=REF_AUDIO,
-            ref_text=REF_TEXT,
-            gen_text=gen_text,
-            seed=None,
-        )
-
-        sf.write(output_path, wav, sr)
-        elapsed = time.time() - start
-        success += 1
-        print(f"✅ Готово за {elapsed:.2f} сек.")
-
-        previous_generated[filename] = {"text": gen_text, "speaker": speaker}
-        save_generated_manifest()
-
-        if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated() / 1024**3
-            reserved = torch.cuda.memory_reserved() / 1024**3
-            print(
-                f"GPU: {allocated:.2f} GB allocated / {reserved:.2f} GB reserved"
+        print(f"[{index}/{len(pending)}] {filename}...")
+        try:
+            wav, sr, _ = f5tts.infer(
+                ref_file=REF_AUDIO,
+                ref_text=REF_TEXT,
+                gen_text=row["text"],
+                seed=None,
             )
+            sf.write(output_path, wav, sr)
+            success += 1
+            save_generated_manifest()
 
-        if success % 20 == 0:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            print(f"🧹 GPU cache очищен после {success} файлов")
-
-        if success % UPLOAD_EVERY == 0:
-            print("\n📤 Промежуточная синхронизация с HF...")
-            try:
+            if success % UPLOAD_EVERY == 0:
+                print("📤 Промежуточный upload на HF...")
                 api.upload_folder(
-                    folder_path=OUTPUT_DIR,
-                    path_in_repo=HF_WAV_DIR,
-                    repo_id=OUTPUT_DATASET_REPO,
-                    repo_type="dataset",
-                    allow_patterns="*.wav",
-                    commit_message=f"Auto upload: {success} generated files",
+                    folder_path=OUTPUT_DIR, path_in_repo=HF_WAV_DIR,
+                    repo_id=OUTPUT_DATASET_REPO, repo_type="dataset", allow_patterns="*.wav"
                 )
                 api.upload_file(
                     path_or_fileobj=GENERATED_MANIFEST_PATH,
                     path_in_repo=GENERATED_MANIFEST_FILENAME,
-                    repo_id=OUTPUT_DATASET_REPO,
-                    repo_type="dataset",
-                    commit_message="Update generated manifest",
+                    repo_id=OUTPUT_DATASET_REPO, repo_type="dataset"
                 )
-                print("✅ HF синхронизация завершена")
-            except Exception as e:
-                print(f"⚠️ HF upload ошибка: {e}")
-
-    except Exception as e:
-        errors += 1
-        print(f"\n❌ Ошибка генерации {filename}:\n{e}\n➡️ Продолжаем...")
+        except Exception as e:
+            print(f"❌ Ошибка {filename}: {e}")
 
 # ============================================================
-# 12. ФИНАЛЬНЫЙ MANIFEST И СИНХРОНИЗАЦИЯ
+# ФИНАЛЬНАЯ СИНХРОНИЗАЦИЯ И МЕТКА DONE
 # ============================================================
 
-print("\n" + "=" * 70 + "\n📝 СОХРАНЕНИЕ И СИНХРОНИЗАЦИЯ\n" + "=" * 70)
+print("\n📤 Финальная загрузка результатов на HF...")
 save_generated_manifest()
 
 try:
-    print("📤 Загружаем WAV...")
     api.upload_folder(
-        folder_path=OUTPUT_DIR,
-        path_in_repo=HF_WAV_DIR,
-        repo_id=OUTPUT_DATASET_REPO,
-        repo_type="dataset",
-        allow_patterns="*.wav",
-        commit_message="Update generated TTS audio",
+        folder_path=OUTPUT_DIR, path_in_repo=HF_WAV_DIR,
+        repo_id=OUTPUT_DATASET_REPO, repo_type="dataset", allow_patterns="*.wav"
     )
-    print("✅ WAV загружены")
-
-    print("📤 Загружаем generated_manifest.csv...")
     api.upload_file(
         path_or_fileobj=GENERATED_MANIFEST_PATH,
         path_in_repo=GENERATED_MANIFEST_FILENAME,
-        repo_id=OUTPUT_DATASET_REPO,
-        repo_type="dataset",
-        commit_message="Update generated TTS manifest",
+        repo_id=OUTPUT_DATASET_REPO, repo_type="dataset"
     )
-    print("✅ generated_manifest.csv загружен")
+    print("✅ Все данные успешно загружены!")
+
+    # Помечаем главу как выполнившую работу
+    mark_repository_done(TARGET_REPO_ID, WORKER_ID)
 
 except Exception as e:
     print(f"❌ Ошибка финальной загрузки: {e}")
 
-# ============================================================
-# 14. СТАТИСТИКА
-# ============================================================
-
-total_time = time.time() - total_start
-print("\n" + "=" * 70 + "\n🎉 ГОТОВО\n" + "=" * 70)
-print(f"Успешно:       {success}")
-print(f"Ошибок:        {errors}")
-print(f"Время:         {total_time / 60:.1f} минут")
-if success > 0:
-    print(f"Среднее:       {total_time / success:.2f} сек/файл")
-print(f"Результаты:    {OUTPUT_DIR}")
-print(f"HF WAV:        {OUTPUT_DATASET_REPO}/{HF_WAV_DIR}")
-print(
-    f"HF Manifest:   {OUTPUT_DATASET_REPO}/{GENERATED_MANIFEST_FILENAME}"
-)
+print("=" * 70)
+print(f"🎉 РАБОТА ВОРКЕРА {WORKER_ID} НАД {TARGET_REPO_ID} ЗАВЕРШЕНА!")
 print("=" * 70)
