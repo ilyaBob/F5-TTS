@@ -1,9 +1,12 @@
 import csv
 import os
+import re
 import shutil
 import sys
 import time
 from pathlib import Path
+
+import numpy as np
 
 try:
     from dotenv import load_dotenv
@@ -67,6 +70,49 @@ api = HfApi(token=HF_TOKEN)
 
 
 # ============================================================
+# 🛠️ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (ДЛИТЕЛЬНОСТЬ И SPEED)
+# ============================================================
+
+def clean_text(text: str) -> str:
+    """Удаляет символы пунктуации для точного подсчета символов."""
+    return re.sub(r"[^\w\s]", "", text).strip()
+
+
+def calculate_speed_for_text(
+    text: str,
+    chars_per_sec: float = 11.0,
+    short_target_sec: float = 3.5,
+    min_speed: float = 0.1,
+    max_speed: float = 1.0,
+) -> float:
+    """
+    Рассчитывает speed точно по логике успешного эксперимента.
+    Для коротких фраз (< 15 символов) задает целевое время ~3.5 сек,
+    что дает speed ~0.364 и предотвращает обрезание концовки.
+    """
+    cleaned = clean_text(text)
+    char_len = len(cleaned)
+
+    if char_len == 0:
+        return 1.0
+
+    # Естественная ожидаемая длительность
+    estimated_duration = max(0.4, char_len / chars_per_sec)
+
+    # Если фраза короткая, растягиваем целевую длительность до 3.5 сек
+    if char_len <= 15:
+        target_duration = short_target_sec
+    else:
+        target_duration = estimated_duration
+
+    # Расчет точно по формуле из манифеста эксперимента
+    calculated_speed = estimated_duration / target_duration
+    speed = float(np.clip(calculated_speed, min_speed, max_speed))
+
+    return round(speed, 4)
+
+
+# ============================================================
 # 🎯 МЕХАНИЗМ БЛОКИРОВКИ И ПОИСКА СВОБОДНОГО РЕПОЗИТОРИЯ
 # ============================================================
 
@@ -84,20 +130,16 @@ def get_collection_repositories(collection_slug):
 
 
 def try_lock_repository(repo_id, worker_id):
-    """
-    Пытается заблокировать репозиторий под текущий WORKER_ID.
-    Возвращает True, если репозиторий успешно заблокирован за нами.
-    """
+    """Пытается заблокировать репозиторий под текущий WORKER_ID."""
     lock_file_path = os.path.join(WORK_DIR, LOCK_FILENAME)
 
-    # 1. Проверяем текущее состояние LOCK_STATUS.txt на HF
     try:
         downloaded_lock = hf_hub_download(
             repo_id=repo_id,
             filename=LOCK_FILENAME,
             repo_type="dataset",
             token=HF_TOKEN,
-            force_download=True
+            force_download=True,
         )
         with open(downloaded_lock, "r", encoding="utf-8") as f:
             current_status = f.read().strip()
@@ -110,12 +152,10 @@ def try_lock_repository(repo_id, worker_id):
             return False
 
     except EntryNotFoundError:
-        # Файла блокировки ещё нет — репозиторий свободен
         pass
     except Exception as e:
-        print(f"   ⚠️ Ошибка чтения lock-файла: {e}")
+        print(f"   ⚠️️ Ошибка чтения lock-файла: {e}")
 
-    # 2. Пишем свою метку и загружаем на HF
     print(f"   ✍️ Запись метки {worker_id} в {repo_id}...")
     with open(lock_file_path, "w", encoding="utf-8") as f:
         f.write(f"IN_PROGRESS:{worker_id}")
@@ -126,24 +166,22 @@ def try_lock_repository(repo_id, worker_id):
             path_in_repo=LOCK_FILENAME,
             repo_id=repo_id,
             repo_type="dataset",
-            commit_message=f"Lock repo for {worker_id}"
+            commit_message=f"Lock repo for {worker_id}",
         )
     except Exception as e:
         print(f"   ❌ Ошибка загрузки lock-файла: {e}")
         return False
 
-    # 3. Пауза 10 секунд (гонка процессов)
     print("   ⏳ Ожидание 10 сек для проверки гонки процессов...")
     time.sleep(10)
 
-    # 4. Повторно скачиваем и проверяем, кто остался записан
     try:
         downloaded_lock = hf_hub_download(
             repo_id=repo_id,
             filename=LOCK_FILENAME,
             repo_type="dataset",
             token=HF_TOKEN,
-            force_download=True
+            force_download=True,
         )
         with open(downloaded_lock, "r", encoding="utf-8") as f:
             final_status = f.read().strip()
@@ -170,7 +208,7 @@ def mark_repository_done(repo_id, worker_id):
             path_in_repo=LOCK_FILENAME,
             repo_id=repo_id,
             repo_type="dataset",
-            commit_message=f"Mark done by {worker_id}"
+            commit_message=f"Mark done by {worker_id}",
         )
         print(f"✅ Репозиторий {repo_id} помечен как DONE.")
     except Exception as e:
@@ -218,6 +256,21 @@ f5tts = F5TTS(
 )
 print("✅ Модель готова к работе!")
 
+# Warm-up (прогрев GPU для стабилизации первых прогонов)
+print("🔥 Прогрев модели (Warm-up)...")
+try:
+    _ = f5tts.infer(
+        ref_file=REF_AUDIO,
+        ref_text=REF_TEXT,
+        gen_text="Прогрев модели.",
+        seed=1,
+        speed=1.0,
+    )
+    print("✅ Прогрев завершён успешно.")
+except Exception as e:
+    print(f"⚠️ Предупреждение при прогреве: {e}")
+
+
 # ============================================================
 # ГЛАВНЫЙ ЦИКЛ ОБРАБОТКИ ВСЕХ РЕПОЗИТОРИЕВ
 # ============================================================
@@ -239,7 +292,6 @@ while True:
         print("=" * 70)
         break
 
-    # Очищаем локальные папки от предыдущего репозитория
     clear_local_work_dirs()
 
     MANIFEST_REPO_ID = TARGET_REPO_ID
@@ -299,7 +351,7 @@ while True:
                 if r.get("filename"):
                     previous_generated[r["filename"]] = {
                         "text": r.get("text", ""),
-                        "speaker": r.get("speaker", "")
+                        "speaker": r.get("speaker", ""),
                     }
     except Exception:
         pass
@@ -332,16 +384,26 @@ while True:
         success = 0
         for index, row in enumerate(pending, start=1):
             filename = row["filename"]
+            text_to_gen = row["text"]
             output_path = os.path.join(OUTPUT_DIR, filename)
 
-            print(f"[{index}/{len(pending)}] {filename}...")
+            # Вычисление точной скорости
+            calculated_speed = calculate_speed_for_text(text_to_gen)
+
+            print(
+                f"[{index}/{len(pending)}] {filename} | "
+                f"Символов: {len(clean_text(text_to_gen))} | Speed: {calculated_speed}..."
+            )
+
             try:
                 wav, sr, _ = f5tts.infer(
                     ref_file=REF_AUDIO,
                     ref_text=REF_TEXT,
-                    gen_text=row["text"],
-                    seed=None,
+                    gen_text=text_to_gen,
+                    speed=calculated_speed,
+                    seed=1,
                 )
+
                 sf.write(output_path, wav, sr)
                 success += 1
                 save_generated_manifest()
@@ -349,13 +411,17 @@ while True:
                 if success % UPLOAD_EVERY == 0:
                     print("📤 Промежуточный upload на HF...")
                     api.upload_folder(
-                        folder_path=OUTPUT_DIR, path_in_repo=HF_WAV_DIR,
-                        repo_id=OUTPUT_DATASET_REPO, repo_type="dataset", allow_patterns="*.wav"
+                        folder_path=OUTPUT_DIR,
+                        path_in_repo=HF_WAV_DIR,
+                        repo_id=OUTPUT_DATASET_REPO,
+                        repo_type="dataset",
+                        allow_patterns="*.wav",
                     )
                     api.upload_file(
                         path_or_fileobj=GENERATED_MANIFEST_PATH,
                         path_in_repo=GENERATED_MANIFEST_FILENAME,
-                        repo_id=OUTPUT_DATASET_REPO, repo_type="dataset"
+                        repo_id=OUTPUT_DATASET_REPO,
+                        repo_type="dataset",
                     )
             except Exception as e:
                 print(f"❌ Ошибка {filename}: {e}")
@@ -366,17 +432,21 @@ while True:
 
     try:
         api.upload_folder(
-            folder_path=OUTPUT_DIR, path_in_repo=HF_WAV_DIR,
-            repo_id=OUTPUT_DATASET_REPO, repo_type="dataset", allow_patterns="*.wav"
+            folder_path=OUTPUT_DIR,
+            path_in_repo=HF_WAV_DIR,
+            repo_id=OUTPUT_DATASET_REPO,
+            repo_type="dataset",
+            allow_patterns="*.wav",
         )
         api.upload_file(
             path_or_fileobj=GENERATED_MANIFEST_PATH,
             path_in_repo=GENERATED_MANIFEST_FILENAME,
-            repo_id=OUTPUT_DATASET_REPO, repo_type="dataset"
+            repo_id=OUTPUT_DATASET_REPO,
+            repo_type="dataset",
         )
         print("✅ Все данные успешно загружены!")
 
-        # Помечаем главу как выполнившую работу
+        # Помечаем репозиторий как выполненный
         mark_repository_done(TARGET_REPO_ID, WORKER_ID)
 
     except Exception as e:
@@ -385,4 +455,3 @@ while True:
     print("=" * 70)
     print(f"🎉 РАБОТА ВОРКЕРА {WORKER_ID} НАД {TARGET_REPO_ID} ЗАВЕРШЕНА!")
     print("=" * 70)
-    # Цикл переходит к следующей итерации (while True) и ищет следующий свободный репозиторий
