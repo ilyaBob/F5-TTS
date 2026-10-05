@@ -18,11 +18,7 @@ except ImportError:
 import soundfile as sf
 import torch
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
-from huggingface_hub.utils import (
-    EntryNotFoundError,
-    GatedRepoError,
-    RepositoryNotFoundError,
-)
+from huggingface_hub.utils import EntryNotFoundError
 
 # ============================================================
 # ⚙️ КОНФИГУРАЦИЯ (.env)
@@ -35,12 +31,10 @@ HF_COLLECTION_SLUG = os.getenv("HF_COLLECTION_SLUG")
 MANIFEST_FILENAME = os.getenv("MANIFEST_FILENAME", "dataset_manifest.csv")
 HF_WAV_DIR = os.getenv("HF_WAV_DIR", "generated_wavs")
 
-# Пути к директориям
 F5_DIR = os.getenv("F5_DIR", "/content/F5-TTS")
 WORK_DIR = os.path.join(F5_DIR, "manifest_work")
 OUTPUT_DIR = os.path.join(F5_DIR, "output_audio")
 
-# Чекпоинты и модель
 MODEL_DIR_NAME = os.getenv("MODEL_DIR_NAME")
 LOCAL_CKPT_DIR = os.path.join(F5_DIR, "ckpts", MODEL_DIR_NAME)
 CKPT_FILE_NAME = os.getenv("FILE_NAME")
@@ -49,7 +43,6 @@ VOCAB_FILE_NAME = os.getenv("VOCAB_FILE_NAME")
 CKPT_PATH = os.path.join(LOCAL_CKPT_DIR, CKPT_FILE_NAME)
 VOCAB_PATH = os.path.join(LOCAL_CKPT_DIR, VOCAB_FILE_NAME)
 
-# Референсы
 REF_AUDIO = os.path.join(
     os.getenv("DATASET_DIR", os.path.join(F5_DIR, "dataset")),
     os.getenv("WAV_FILENAME", ""),
@@ -70,54 +63,66 @@ api = HfApi(token=HF_TOKEN)
 
 
 # ============================================================
-# 🛠️ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (ДЛИТЕЛЬНОСТЬ И SPEED)
+# 🛠️ ГЛОБАЛЬНАЯ ЗАЩИТА ОТ ОБРЕЗАНИЙ (ДЛЯ ВСЕХ ДЛИН ТЕКСТА)
 # ============================================================
 
-def clean_text(text: str) -> str:
-    """Удаляет символы пунктуации для точного подсчета символов."""
-    return re.sub(r"[^\w\s]", "", text).strip()
+def clean_text_for_stats(text: str) -> str:
+    """Удаляет символы ударений (+) и пунктуацию для чистого подсчета длины."""
+    text_no_accents = text.replace("+", "")
+    return re.sub(r"[^\w\s]", "", text_no_accents).strip()
 
 
-def calculate_speed_for_text(
-    text: str,
-    chars_per_sec: float = 11.0,
-    short_target_sec: float = 3.5,
-    min_speed: float = 0.1,
-    max_speed: float = 1.0,
+def calculate_robust_speed(
+        text: str,
+        chars_per_sec: float = 11.0,
+        short_target_sec: float = 3.5,
+        max_safe_speed: float = 0.82,  # Выше 0.82 в F5-TTS лучше не подниматься
+        min_speed: float = 0.1,
 ) -> float:
     """
-    Рассчитывает speed точно по логике успешного эксперимента.
-    Для коротких фраз (< 15 символов) задает целевое время ~3.5 сек,
-    что дает speed ~0.364 и предотвращает обрезание концовки.
+    Рассчитывает запас времени и безопасную скорость для ТЕКСТА ЛЮБОЙ ДЛИНЫ.
+    - До 25 символов: фиксированная цель 3.5 сек (speed ~0.35-0.45).
+    - Более 25 символов: базовая длительность + 20% запаса на договаривание концовки.
     """
-    cleaned = clean_text(text)
+    cleaned = clean_text_for_stats(text)
     char_len = len(cleaned)
 
     if char_len == 0:
         return 1.0
 
-    # Естественная ожидаемая длительность
-    estimated_duration = max(0.4, char_len / chars_per_sec)
+    # Естественная базовая длительность на основе длины текста
+    base_duration = char_len / chars_per_sec
 
-    # Если фраза короткая, растягиваем целевую длительность до 3.5 сек
-    if char_len <= 15:
-        target_duration = short_target_sec
+    if char_len <= 25:
+        # Для коротких фраз (включая "Глав+а трин+адцатая")
+        target_duration = max(short_target_sec, base_duration * 1.5)
     else:
-        target_duration = estimated_duration
+        # Для средних и длинных фраз: добавляем 20% запаса времени на интонации и концовки
+        target_duration = base_duration * 1.20
 
-    # Расчет точно по формуле из манифеста эксперимента
-    calculated_speed = estimated_duration / target_duration
-    speed = float(np.clip(calculated_speed, min_speed, max_speed))
+    calculated_speed = base_duration / target_duration
+    speed = float(np.clip(calculated_speed, min_speed, max_safe_speed))
 
     return round(speed, 4)
 
 
+def prepare_text_with_tail_padding(text: str) -> str:
+    """
+    Добавляет безопасную микро-паузу в конец текста, чтобы модель
+    гарантированно успевала уйти в тишину и не обрезала последнюю букву.
+    """
+    text = text.strip()
+    # Если текст не заканчивается знаками препинания, добавляем точку
+    if not text.endswith((".", "!", "?", "...", "…")):
+        text += "."
+    return text
+
+
 # ============================================================
-# 🎯 МЕХАНИЗМ БЛОКИРОВКИ И ПОИСКА СВОБОДНОГО РЕПОЗИТОРИЯ
+# 🎯 БЛОКИРОВКА И УПРАВЛЕНИЕ РЕПОЗИТОРИЯМИ
 # ============================================================
 
 def get_collection_repositories(collection_slug):
-    """Получает список всех dataset-репозиториев из коллекции."""
     print(f"\n📚 Запрос коллекции: {collection_slug}...")
     try:
         collection = api.get_collection(collection_slug)
@@ -130,7 +135,6 @@ def get_collection_repositories(collection_slug):
 
 
 def try_lock_repository(repo_id, worker_id):
-    """Пытается заблокировать репозиторий под текущий WORKER_ID."""
     lock_file_path = os.path.join(WORK_DIR, LOCK_FILENAME)
 
     try:
@@ -154,7 +158,7 @@ def try_lock_repository(repo_id, worker_id):
     except EntryNotFoundError:
         pass
     except Exception as e:
-        print(f"   ⚠️️ Ошибка чтения lock-файла: {e}")
+        print(f"   ⚠ Ошибка чтения lock-файла: {e}")
 
     print(f"   ✍️ Запись метки {worker_id} в {repo_id}...")
     with open(lock_file_path, "w", encoding="utf-8") as f:
@@ -198,7 +202,6 @@ def try_lock_repository(repo_id, worker_id):
 
 
 def mark_repository_done(repo_id, worker_id):
-    """Помечает репозиторий как полностью обработанный."""
     lock_file_path = os.path.join(WORK_DIR, LOCK_FILENAME)
     with open(lock_file_path, "w", encoding="utf-8") as f:
         f.write("DONE")
@@ -216,7 +219,6 @@ def mark_repository_done(repo_id, worker_id):
 
 
 def clear_local_work_dirs():
-    """Очищает локальные рабочие папки перед обработкой нового репозитория."""
     for folder in [WORK_DIR, OUTPUT_DIR]:
         if os.path.exists(folder):
             shutil.rmtree(folder)
@@ -224,7 +226,7 @@ def clear_local_work_dirs():
 
 
 # ============================================================
-# GPU & ИНИЦИАЛИЗАЦИЯ МОДЕЛИ (Один раз на весь запуск)
+# GPU & ИНИЦИАЛИЗАЦИЯ МОДЕЛИ
 # ============================================================
 
 print("=" * 70)
@@ -256,7 +258,6 @@ f5tts = F5TTS(
 )
 print("✅ Модель готова к работе!")
 
-# Warm-up (прогрев GPU для стабилизации первых прогонов)
 print("🔥 Прогрев модели (Warm-up)...")
 try:
     _ = f5tts.infer(
@@ -264,20 +265,18 @@ try:
         ref_text=REF_TEXT,
         gen_text="Прогрев модели.",
         seed=1,
-        speed=1.0,
+        speed=0.8,
     )
     print("✅ Прогрев завершён успешно.")
 except Exception as e:
     print(f"⚠️ Предупреждение при прогреве: {e}")
 
-
 # ============================================================
-# ГЛАВНЫЙ ЦИКЛ ОБРАБОТКИ ВСЕХ РЕПОЗИТОРИЕВ
+# ГЛАВНЫЙ ЦИКЛ ОБРАБОТКИ
 # ============================================================
 
 while True:
     repos_to_process = get_collection_repositories(HF_COLLECTION_SLUG)
-
     TARGET_REPO_ID = None
 
     for repo in repos_to_process:
@@ -299,7 +298,6 @@ while True:
 
     print(f"\n🚀 НАЧИНАЕМ РАБОТУ С РЕПОЗИТОРИЕМ: {TARGET_REPO_ID}")
 
-    # --- СКАЧИВАНИЕ MANIFEST & СУЩЕСТВУЮЩИХ WAV ---
     local_manifest_path = hf_hub_download(
         repo_id=MANIFEST_REPO_ID,
         filename=MANIFEST_FILENAME,
@@ -324,7 +322,6 @@ while True:
     except Exception as e:
         print("ℹ️ WAV файлы ранее не загружались или ошибка:", e)
 
-    # --- ЧТЕНИЕ MANIFEST И ИСТОРИИ ---
     rows = []
     with open(local_manifest_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -379,23 +376,28 @@ while True:
                     writer.writerow(row)
 
 
-    # --- ЦИКЛ ГЕНЕРАЦИИ ДЛЯ ТЕКУЩЕГО РЕПОЗИТОРИЯ ---
+    # --- ЦИКЛ ГЕНЕРАЦИИ С ДВОЙНОЙ ЗАЩИТОЙ ---
     if pending:
         success = 0
         for index, row in enumerate(pending, start=1):
             filename = row["filename"]
-            text_to_gen = row["text"]
+            raw_text = row["text"]
             output_path = os.path.join(OUTPUT_DIR, filename)
 
-            # Вычисление точной скорости
-            calculated_speed = calculate_speed_for_text(text_to_gen)
+            # 1. Подготовка текста с tail-padding
+            text_to_gen = prepare_text_with_tail_padding(raw_text)
+
+            # 2. Подсчет надежной скорости
+            calculated_speed = calculate_robust_speed(raw_text)
+            char_count = len(clean_text_for_stats(raw_text))
 
             print(
                 f"[{index}/{len(pending)}] {filename} | "
-                f"Символов: {len(clean_text(text_to_gen))} | Speed: {calculated_speed}..."
+                f"Символов: {char_count} | Speed: {calculated_speed}..."
             )
 
             try:
+                # Первая попытка генерации
                 wav, sr, _ = f5tts.infer(
                     ref_file=REF_AUDIO,
                     ref_text=REF_TEXT,
@@ -403,6 +405,27 @@ while True:
                     speed=calculated_speed,
                     seed=1,
                 )
+
+                duration_sec = len(wav) / sr
+
+                # 3. АВТО-ПРОВЕРКА (Safety Check):
+                # Если сгенерированный звук подозрительно короткий (< 14 символов в секунду),
+                # значит модель проглотила/обрезала фразу. Делаем автоматический ретрай.
+                expected_min_duration = max(1.5, char_count / 16.0)
+
+                if duration_sec < expected_min_duration:
+                    retry_speed = round(calculated_speed * 0.75, 4)
+                    print(
+                        f"⚠️ [SAFETY] Слишком короткий звук ({duration_sec:.2f}s < {expected_min_duration:.2f}s). "
+                        f"Повтор с пониженной скоростью speed={retry_speed}..."
+                    )
+                    wav, sr, _ = f5tts.infer(
+                        ref_file=REF_AUDIO,
+                        ref_text=REF_TEXT,
+                        gen_text=text_to_gen,
+                        speed=retry_speed,
+                        seed=1,
+                    )
 
                 sf.write(output_path, wav, sr)
                 success += 1
@@ -426,7 +449,6 @@ while True:
             except Exception as e:
                 print(f"❌ Ошибка {filename}: {e}")
 
-    # --- ФИНАЛЬНАЯ СИНХРОНИЗАЦИЯ И МЕТКА DONE ---
     print("\n📤 Финальная загрузка результатов на HF...")
     save_generated_manifest()
 
@@ -445,8 +467,6 @@ while True:
             repo_type="dataset",
         )
         print("✅ Все данные успешно загружены!")
-
-        # Помечаем репозиторий как выполненный
         mark_repository_done(TARGET_REPO_ID, WORKER_ID)
 
     except Exception as e:
